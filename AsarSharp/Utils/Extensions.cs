@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 
 namespace AsarSharp.Utils
@@ -8,9 +10,7 @@ namespace AsarSharp.Utils
     public static class Extensions
     {
         /// <summary>
-        /// Fills <paramref name="count"/> bytes. Stream.Read may legally return fewer than
-        /// asked for; treating a short read as EOF corrupts header parsing and block hashes.
-        /// Returns the bytes actually read, which is less than count only at end of stream.
+        /// Fills <paramref name="count"/> bytes to prevent short reads from corrupting parsing.
         /// </summary>
         public static int ReadFull(this Stream stream, byte[] buffer, int offset, int count)
         {
@@ -154,24 +154,73 @@ namespace AsarSharp.Utils
         }
 
         /// <summary>
-        /// Overwrites <paramref name="destination"/>, clearing attributes on both ends. CopyFile
-        /// carries the source's ReadOnly flag onto the copy and then refuses to overwrite what it
-        /// produced, failing with "Access to the path is denied" - so one read-only source (an exe
-        /// run straight out of a .zip, say) poisons the destination for every later run.
+        /// Overwrites <paramref name="destination"/>, clearing attributes to prevent ReadOnly errors on subsequent runs.
         /// </summary>
         public static void CopyOver(string source, string destination)
         {
             ClearAttributes(destination);
-            File.Copy(source, destination, true);
+
+            try
+            {
+                File.Copy(source, destination, true);
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                throw new UnauthorizedAccessException($"{e.Message} {DescribeDenial(destination)}", e);
+            }
+
             ClearAttributes(destination);
         }
 
-        /// <summary>Resets a file to Normal: ReadOnly, Hidden and System all block an overwrite.</summary>
+        /// <summary>
+        /// Provides detailed diagnostic info for "Access to the path is denied" errors.
+        /// </summary>
+        private static string DescribeDenial(string destination)
+        {
+            if (Directory.Exists(destination))
+            {
+                return "The destination is a directory, not a file.";
+            }
+
+            if (!File.Exists(destination))
+            {
+                return "The destination does not exist, so the containing folder is refusing new files.";
+            }
+
+            return $"Attributes {File.GetAttributes(destination)}, owner {DescribeOwner(destination)}, " +
+                   $"running as {Environment.UserName}. A read-only flag, antivirus, folder " +
+                   "permissions or a delete still pending on the file are the usual causes.";
+        }
+
+        private static string DescribeOwner(string path)
+        {
+            try
+            {
+                return File.GetAccessControl(path).GetOwner(typeof(NTAccount)).Value;
+            }
+            catch (Exception e) when (e is IdentityNotMappedException || e is UnauthorizedAccessException ||
+                                      e is InvalidOperationException || e is PrivilegeNotHeldException ||
+                                      e is PlatformNotSupportedException)
+            {
+                return "unreadable";
+            }
+        }
+
+        /// <summary>
+        /// Resets a file to Normal to prevent overwrite failures. Best effort.
+        /// </summary>
         public static void ClearAttributes(string path)
         {
-            if (File.Exists(path))
+            try
             {
-                File.SetAttributes(path, FileAttributes.Normal);
+                if (File.Exists(path))
+                {
+                    File.SetAttributes(path, FileAttributes.Normal);
+                }
+            }
+            catch (Exception e) when (e is UnauthorizedAccessException || e is IOException)
+            {
+                // Swallowed so the caller's own failure is the one that surfaces.
             }
         }
 
